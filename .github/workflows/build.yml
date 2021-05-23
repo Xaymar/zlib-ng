@@ -1,0 +1,146 @@
+# Targetting Zen1 minimum:
+#  BMI, BMI2, F16C, FMA, FSGSBASE, AVX, AVX2, ADCX, RDSEED, MWAITX, SHA, CLZERO,
+#  AES, PCLMUL, CX16, MOVBE, MMX, SSE, SSE2, SSE3, SSE4A, SSSE3, SSE4.1, SSE4.2,
+#  ABM, XSAVEC, XSAVES, CLFLUSHOPT, POPCNT
+
+name: Build
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, Tag or Commit to build'
+        required: true
+        default: 'master'
+
+jobs:
+  compile:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        bits: [ 32, 64 ]
+        include:
+          - bits: 32
+            arch: "i686"
+            prefix: "i686-w64-mingw32"
+          - bits: 64
+            arch: "x86_64"
+            prefix: "x86_64-w64-mingw32"
+    name: "Windows (${{ matrix.bits }}bit)"
+    outputs:
+      is_tag: ${{ steps.data.outputs.is_tag }}
+      major: ${{ steps.data.outputs.major }}
+      minor: ${{ steps.data.outputs.minor }}
+      commit: ${{ steps.data.outputs.commit }}
+    steps:
+    - name: "Checkout"
+      uses: actions/checkout@v2
+      with:
+        ref: "${{ github.event.inputs.ref }}"
+        submodules: "recursive"
+        fetch-depth: 0
+    - name: "Dependencies: Packages"
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install \
+          build-essential git \
+          cmake make ninja-build \
+          pkg-config \
+          mingw-w64 mingw-w64-tools gcc-mingw-w64 g++-mingw-w64 \
+          nasm
+    - name: "Gather Information"
+      id: data
+      shell: bash
+      run: |
+        is_tag=false
+        if git show-ref -q --verify "refs/tags/${{ github.event.inputs.ref }}"; then
+          is_tag=true
+        fi
+        echo "::set-output name=is_tag::${is_tag}"
+    - name: "Configure"
+      shell: bash
+      run: |
+        cmake -H. -Bbuild/build \
+          -DCMAKE_TOOLCHAIN_FILE=./cmake/toolchain-mingw-${{ matrix.arch }}.cmake \
+          -DCMAKE_BUILD_TYPE=RELEASE -DZLIB_COMPAT=ON -DZLIB_ENABLE_TESTS=OFF -DBUILD_SHARED_LIBS=ON \
+          -DCMAKE_INSTALL_PREFIX=./build/distrib/
+    - name: "Compile"
+      shell: bash
+      run: |
+        cmake --build build/build --target install
+    - name: "Make MSVC compatible"
+      shell: bash
+      run: |
+        pushd "./build/distrib" > /dev/null
+          # Fix ZLIB_COMPAT=ON still adding a suffix.
+          cp ./lib/libzlib.dll.a ./lib/libz.dll.a
+
+          # Generate MSVC compatible .lib file
+          gendef - ./bin/libzlib1.dll > ./lib/libzlib.def
+          ${{ matrix.prefix }}-dlltool -d ./lib/libzlib.def -l ./lib/libzlib.lib
+          cp ./lib/libzlib.lib ./lib/libz.lib
+        popd > /dev/null
+    - name: "Upload Artifact"
+      uses: actions/upload-artifact@v1
+      with:
+        name: zlib-ng-${{ matrix.bits }}
+        path: build/distrib
+  release:
+    name: "Create Release"
+    if: needs.compile.outputs.is_tag
+    needs: compile
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+    - name: "Checkout"
+      uses: actions/checkout@v2
+      with:
+        ref: "${{ github.event.inputs.ref }}"
+        submodules: "recursive"
+        fetch-depth: 0
+    - name: "Gather Information"
+      id: data
+      shell: bash
+      run: |
+        echo "::set-output name=message::$(git log --format=%B -n 1 \"${{ github.event.inputs.ref }}\")"
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.event.inputs.ref }}
+        release_name: "zlib-ng v${{ github.event.inputs.ref }}"
+        body: ${{ steps.data.outputs.message }}
+        draft: false
+        prerelease: true
+        commitish: ${{ needs.compile.outputs.commit }}
+  upload:
+    name: "Upload Release"
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        bits: [ 32, 64 ]
+    steps:
+    - name: "Download Artifact"
+      uses: actions/download-artifact@v1
+      with:
+        name: zlib-ng-${{ matrix.bits }}
+        path: .
+    - name: "Compress Binaries"
+      shell: bash
+      run: |
+        7z a -mmt1 -mm=Deflate -mfb=258 -mpass=15 -r -ssw  zlib-ng-${{ matrix.bits }}.zip ./
+    - name: "Upload Release"
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.release.outputs.upload_url }}
+        asset_path: ./zlib-ng-${{ matrix.bits }}.zip
+        asset_name: zlib-ng-${{ matrix.bits }}.zip
+        asset_content_type: application/zip
